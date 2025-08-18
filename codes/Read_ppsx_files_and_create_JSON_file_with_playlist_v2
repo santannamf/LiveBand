@@ -1,42 +1,51 @@
 /**
- * Scan a Drive folder for .ppsx files and build songs.json
- * Folder ID is taken from Script Properties: FOLDER_ID
+ * LIVE BAND — Build/refresh songs.json from a Google Drive folder of .ppsx
+ * - Parses messy filenames (CamelCase/digits) and tries to infer Artist/Title
+ * - Enriches with free web sources (MusicBrainz + Wikipedia) for genre/epoch
+ * - Writes/updates songs.json in the same Drive folder
+ *
+ * REQUIRED Script Property (Configurações do projeto → Propriedades do script):
+ *   FOLDER_ID = <ID da pasta do Google Drive com os .ppsx>
+ *
+ * OPTIONAL: Create weekly trigger (sexta 16:00 BRT) by running setupWeeklyTrigger() once.
  */
+
+const PROPS = PropertiesService.getScriptProperties();
+const MB_HEADERS = { 'User-Agent': 'LiveBandApp/1.0 (you@example.com)' };
+const PPSX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.slideshow';
+
+/** MAIN — scan folder, enrich, and write songs.json */
 function updateSongsJson() {
-  var folderId = PropertiesService.getScriptProperties().getProperty("FOLDER_ID");
-  if (!folderId) throw new Error("FOLDER_ID ausente em Propriedades do script.");
+  const folderId = PROPS.getProperty('FOLDER_ID');
+  if (!folderId) throw new Error('FOLDER_ID ausente em Propriedades do script.');
 
-  var folder = DriveApp.getFolderById(folderId);
+  const folder = DriveApp.getFolderById(folderId);
 
-  // Iterate ALL files and filter for PPSX by name or MIME (PPSX MIME is not covered by MimeType.MICROSOFT_POWERPOINT)
-  var PPSX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.slideshow';
-  var files = [];
-  var it = folder.getFiles();
-  while (it.hasNext()) {
-    var f = it.next();
-    var name = f.getName();
-    var mime = f.getMimeType();
-    if (/\.ppsx$/i.test(name) || mime === PPSX_MIME) {
-      if (!/^~\$/i.test(name)) files.push(f); // ignore temporary files like "~$..."
-    }
-  }
+  // Load existing songs.json so we don’t duplicate (match by _drive_id or id)
+  const existing = fetchSongsFromDrive_(folder);
+  const known = new Set(existing.map(s => s._drive_id || s.id));
 
-  var songs = [];
+  // Collect PPSX files
+  const files = listPpsx_(folder);
+  const additions = [];
 
-  files.forEach(function(file) {
-    var nameNoExt = file.getName().replace(/\.ppsx$/i, "");
-    var parsed = parseArtistAndTitle_(nameNoExt); // { artist, title }
-    var id = slug_(parsed.title);
+  files.forEach(file => {
+    if (known.has(file.getId())) return;
 
-    songs.push({
-      id: id,
+    const nameNoExt = file.getName().replace(/\.ppsx$/i, '');
+    const parsed = parseArtistAndTitleSmart_(nameNoExt); // { artist, title } (humanized)
+    const id0 = slug_(parsed.title);
+
+    // Base record
+    let rec = {
+      id: id0,
       title: parsed.title,
       artist: parsed.artist,
       alt_titles: [],
       keywords: [],
       genre: [],
       epoch: null,
-      language: "pt-BR",
+      language: 'pt-BR',
       key: null,
       bpm: null,
       duration_sec: null,
@@ -47,43 +56,218 @@ function updateSongsJson() {
       ccli: null,
       rights: null,
       last_verified_at: new Date().toISOString(),
-      source: "initial-import",
-      notes: "",
+      source: 'initial-import',
+      notes: '',
       _drive_id: file.getId()
-    });
+    };
+
+    // Best-effort enrichment (fills canonical artist/title + genre/epoch)
+    try {
+      const enr = enrich_(parsed.artist, parsed.title); // { canonicalArtist, canonicalTitle, genre[], epoch }
+      if (enr?.canonicalArtist) rec.artist = enr.canonicalArtist;
+      if (enr?.canonicalTitle)  rec.title  = enr.canonicalTitle;
+      if (enr?.genre?.length)   rec.genre  = enr.genre;
+      if (enr?.epoch)           rec.epoch  = enr.epoch;
+      rec.id = slug_(rec.title);
+      rec.source = 'web-enriched';
+      Utilities.sleep(1200); // be polite to MusicBrainz (~1 req/sec)
+    } catch (e) {
+      // keep minimal; can enrich next run
+    }
+
+    additions.push(rec);
   });
 
-  var json = JSON.stringify(songs, null, 2);
-
-  // Save JSON file into the same folder
-  var existing = folder.getFilesByName("songs.json");
-  if (existing.hasNext()) {
-    existing.next().setContent(json);
-  } else {
-    folder.createFile("songs.json", json, MimeType.PLAIN_TEXT);
+  if (!additions.length) {
+    // No new songs; if you want to rewrite songs.json sorted each run, uncomment below:
+    // saveSongsToDrive_(folder, sortByTitle_(existing));
+    return;
   }
+
+  const merged = mergeById_(existing, additions);
+  saveSongsToDrive_(folder, merged);
 }
 
-/* --- helpers --- */
+/** One-time helper: schedule every Friday 16:00 (BRT — America/Sao_Paulo) */
+function setupWeeklyTrigger() {
+  ScriptApp.newTrigger('updateSongsJson')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.FRIDAY)
+    .atHour(16)
+    .nearMinute(0)
+    .create();
+}
 
-// Expected filename: "Artist - Title"
-function parseArtistAndTitle_(base) {
-  var sep = base.indexOf(" - ");
+/** Optional: clear all triggers if you need to recreate */
+function clearAllTriggers() {
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+/* ------------------- Helpers ------------------- */
+
+function listPpsx_(folder) {
+  const out = [];
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    const name = f.getName();
+    const mime = f.getMimeType();
+    if ((/\.ppsx$/i.test(name) || mime === PPSX_MIME) && !/^~\$/i.test(name)) {
+      out.push(f);
+    }
+  }
+  return out;
+}
+
+// Humanize: split CamelCase, digits, underscores/dots → spaces
+function humanize_(s) {
+  return String(s || '')
+    .replace(/[_\.]+/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/(\d+)/g, ' $1 ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Parse filename into {artist, title}. Prefer "Artist - Title" if present; else guess title only.
+function parseArtistAndTitleSmart_(base) {
+  const nice = humanize_(base);
+  const sep = nice.indexOf(' - ');
   if (sep > -1) {
-    return {
-      artist: base.slice(0, sep).trim(),
-      title: base.slice(sep + 3).trim()
-    };
+    return { artist: nice.slice(0, sep).trim(), title: nice.slice(sep + 3).trim() };
   }
-  // fallback: no hyphen → everything is title
-  return { artist: "", title: base.trim() };
+  return { artist: '', title: nice };
 }
 
-// slugify: remove accents; non-alnum → underscore
+// Slugify: remove accents; non-alnum → underscore
 function slug_(s) {
   return s.normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
+}
+
+/* ---- Enrichment (MusicBrainz + Wikipedia) ---- */
+
+function enrich_(artist, title) {
+  const mb = artist
+    ? searchMusicBrainzByArtistTitle_(artist, title)
+    : searchMusicBrainzByTitle_(title);
+
+  let canonicalArtist = artist;
+  let canonicalTitle  = title;
+  if (mb?.bestArtist) canonicalArtist = mb.bestArtist;
+  if (mb?.bestTitle)  canonicalTitle  = mb.bestTitle;
+
+  let genres = [];
+  if (mb?.tags?.length) {
+    genres = mb.tags.map(normalizeGenre_).filter(Boolean);
+  }
+
+  // Wikipedia fallback for genre keywords
+  if (!genres.length) {
+    const wiki = fetchWikipediaSummary_(canonicalTitle) || fetchWikipediaSummary_(`${canonicalArtist} ${canonicalTitle}`);
+    if (wiki?.extract) {
+      const text = wiki.extract.toLowerCase();
+      if (text.includes('sertanejo')) genres.push('Sertanejo');
+      else if (text.includes('gospel')) genres.push('Gospel');
+      else if (text.includes('rock'))   genres.push('Rock');
+      else if (text.includes('pop'))    genres.push('Pop');
+      else if (text.includes('samba'))  genres.push('Samba');
+      else if (text.includes('mpb'))    genres.push('MPB');
+    }
+  }
+
+  const epoch = mb?.year ? (Math.floor(Number(mb.year) / 10) * 10 + 's') : null;
+
+  return {
+    canonicalArtist,
+    canonicalTitle,
+    genre: Array.from(new Set(genres)),
+    epoch
+  };
+}
+
+function searchMusicBrainzByArtistTitle_(artist, title) {
+  const q = `query="${encodeURIComponent(title)}"%20AND%20artist:"${encodeURIComponent(artist)}"&fmt=json&limit=1`;
+  const url = `https://musicbrainz.org/ws/2/recording?${q}`;
+  const resp = UrlFetchApp.fetch(url, { method: 'get', headers: MB_HEADERS, muteHttpExceptions: true });
+  if (resp.getResponseCode() !== 200) return null;
+  const json = JSON.parse(resp.getContentText());
+  const rec = (json.recordings && json.recordings[0]) || null;
+  if (!rec) return null;
+  const year =
+    (rec['first-release-date'] && rec['first-release-date'].split('-')[0]) ||
+    (rec.releases && rec.releases[0] && String(rec.releases[0].date || '').split('-')[0]) ||
+    null;
+  const tags = (rec.tags || []).map(t => t.name || '').filter(Boolean);
+  const bestArtist = (rec['artist-credit'] && rec['artist-credit'][0] && rec['artist-credit'][0].name) || artist || '';
+  const bestTitle  = rec.title || title;
+  return { year, tags, bestArtist, bestTitle };
+}
+
+function searchMusicBrainzByTitle_(title) {
+  const q = `query="${encodeURIComponent(title)}"&fmt=json&limit=1`;
+  const url = `https://musicbrainz.org/ws/2/recording?${q}`;
+  const resp = UrlFetchApp.fetch(url, { method: 'get', headers: MB_HEADERS, muteHttpExceptions: true });
+  if (resp.getResponseCode() !== 200) return null;
+  const json = JSON.parse(resp.getContentText());
+  const rec = (json.recordings && json.recordings[0]) || null;
+  if (!rec) return null;
+  const year =
+    (rec['first-release-date'] && rec['first-release-date'].split('-')[0]) ||
+    (rec.releases && rec.releases[0] && String(rec.releases[0].date || '').split('-')[0]) ||
+    null;
+  const tags = (rec.tags || []).map(t => t.name || '').filter(Boolean);
+  const bestArtist = (rec['artist-credit'] && rec['artist-credit'][0] && rec['artist-credit'][0].name) || '';
+  const bestTitle  = rec.title || title;
+  return { year, tags, bestArtist, bestTitle };
+}
+
+function fetchWikipediaSummary_(title) {
+  for (const lang of ['pt', 'en']) {
+    const url = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
+    const resp = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true });
+    if (resp.getResponseCode() === 200) return JSON.parse(resp.getContentText());
+  }
+  return null;
+}
+
+function normalizeGenre_(g) {
+  const s = String(g || '').toLowerCase();
+  if (!s) return null;
+  if (s.includes('sertanejo')) return 'Sertanejo';
+  if (s.includes('gospel'))    return 'Gospel';
+  if (s.includes('rock'))      return 'Rock';
+  if (s.includes('pop'))       return 'Pop';
+  if (s.includes('samba'))     return 'Samba';
+  if (s.includes('mpb'))       return 'MPB';
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/* ---- songs.json storage in the same Drive folder ---- */
+
+function fetchSongsFromDrive_(folder) {
+  const it = folder.getFilesByName('songs.json');
+  if (!it.hasNext()) return [];
+  const txt = it.next().getBlob().getDataAsString('utf-8') || '[]';
+  try { return JSON.parse(txt); } catch { return []; }
+}
+
+function saveSongsToDrive_(folder, arr) {
+  const json = JSON.stringify(sortByTitle_(arr), null, 2);
+  const it = folder.getFilesByName('songs.json');
+  if (it.hasNext()) it.next().setContent(json);
+  else folder.createFile('songs.json', json, MimeType.PLAIN_TEXT);
+}
+
+function mergeById_(current, adds) {
+  const map = new Map(current.map(o => [o.id, o]));
+  for (const a of adds) if (!map.has(a.id)) map.set(a.id, a);
+  return Array.from(map.values());
+}
+
+function sortByTitle_(arr) {
+  return arr.slice().sort((a, b) => (a.title || '').localeCompare(b.title || '', 'pt-BR'));
 }
