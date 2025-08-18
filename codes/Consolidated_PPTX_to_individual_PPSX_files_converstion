@@ -1,0 +1,411 @@
+!pip install python-pptx lxml -q
+
+import os
+import re
+import uuid
+import zipfile
+import unicodedata
+import shutil
+import time
+from lxml import etree
+from google.colab import files
+from pptx import Presentation
+
+# ============================================
+# CONSTANTES / UTILS
+# ============================================
+STOPWORDS_PT = {
+    "e","de","da","do","das","dos","em","a","o","as","os","para","por","com",
+    "no","na","nos","nas","ao","aos","à","às","dum","duma","num","numa","se",
+    "d'", "n'", "s'", "l'", "m'"
+}
+IGNORAR_POR_NOME_NORMALIZADO = {"indice","indices","índice","índices","index"}
+GUID_SECTION_EXT = "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"
+NS_P   = "http://schemas.openxmlformats.org/presentationml/2006/main"
+NS_P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
+
+CT_PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+CT_PPSX = "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml"
+
+def remover_acentos(s: str) -> str:
+    nfkd = unicodedata.normalize('NFD', s or '')
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+def normalizar_nome(s: str) -> str:
+    return remover_acentos(s).lower().strip()
+
+def capitalize_token(token: str) -> str:
+    def _cap_piece(piece):
+        return piece[:1].upper() + piece[1:].lower() if piece else piece
+    token = "'".join(_cap_piece(p) for p in token.split("'"))
+    token = "-".join(_cap_piece(p) for p in token.split("-"))
+    return token
+
+def formatar_nome_secao_regra(nome: str) -> str:
+    # (3) remove numeração no início (mesmo colada)
+    nome = re.sub(r'^\s*\d+\s*', '', nome or '')
+    # (5) & -> e ; normaliza espaços
+    nome = re.sub(r'\s+', ' ', nome.replace('&', ' e ')).strip()
+    # (4) antes do hífen: sentence case; após: Title Case (exceto conjunções)
+    partes = re.split(r'\s[-–]\s', nome, maxsplit=1)
+    esquerda = partes[0].strip()
+    esquerda = (esquerda[:1].upper() + esquerda[1:].lower()) if esquerda else ""
+    direita = ""
+    if len(partes) == 2:
+        direita_tokens = re.split(r'(\s+)', partes[1].strip())
+        out = []; first_word = True
+        for tok in direita_tokens:
+            if tok.isspace(): out.append(tok); continue
+            low = tok.lower()
+            out.append(capitalize_token(tok) if (first_word or low not in STOPWORDS_PT) else low)
+            first_word = False
+        direita = "".join(out).strip()
+    return f"{esquerda} - {direita}".strip() if direita else esquerda
+
+def gerar_nome_arquivo(nome_formatado: str, used=set()) -> str:
+    """
+    (8) Nome base: sem acentos/esp., apenas [A-Za-z0-9_]; evita colisões (sufixo _1, _2, …)
+    """
+    base = remover_acentos(nome_formatado)
+    base = re.sub(r'[^A-Za-z0-9_]+', '', base) or "Musica"
+    out = base
+    k = 1
+    while out in used:
+        out = f"{base}_{k}"
+        k += 1
+    used.add(out)
+    return out
+
+# ============================================
+# EXTRATOR DE SEÇÕES — XML
+# ============================================
+def extrair_secoes_com_indices_via_xml_stricto(arquivo_pptx):
+    """
+    Retorna [{'nome': str, 'indices_slides': [int, ...]}] lendo:
+      p:presentation / p:extLst / p:ext[@uri=GUID_SECTION_EXT] / *:sectionLst
+    Mapeia p14:sldId/@id -> índice 0-based pela ordem em p:sldIdLst.
+    """
+    tmp = ".__pptx_unpack"
+    if os.path.exists(tmp): shutil.rmtree(tmp)
+    os.makedirs(tmp)
+
+    try:
+        with zipfile.ZipFile(arquivo_pptx, 'r') as z:
+            z.extractall(tmp)
+        pres_xml = os.path.join(tmp, "ppt", "presentation.xml")
+        if not os.path.exists(pres_xml):
+            raise RuntimeError("ppt/presentation.xml não encontrado no pacote.")
+
+        parser = etree.XMLParser(remove_blank_text=True, recover=True)
+        root = etree.parse(pres_xml, parser).getroot()
+
+        def local(tag): return etree.QName(tag).localname
+        q = lambda ns, tag: f"{{{ns}}}{tag}"
+
+        # id -> índice via p:sldIdLst
+        sldIdLst = None
+        for e in root.iter():
+            if local(e.tag) == "sldIdLst":
+                sldIdLst = e; break
+        if sldIdLst is None:
+            raise RuntimeError("p:sldIdLst não encontrado; não é possível mapear a ordem dos slides.")
+
+        id_to_index = {}
+        for idx, e in enumerate([x for x in sldIdLst if local(x.tag) == "sldId"]):
+            sid = e.get("id")
+            if sid is None: continue
+            try: id_to_index[int(sid)] = idx
+            except:
+                try: id_to_index[int(float(sid))] = idx
+                except: pass
+
+        # p:extLst / p:ext[@uri=GUID]
+        extlst = None
+        for e in root.iter():
+            if local(e.tag) == "extLst":
+                extlst = e; break
+        if extlst is None:
+            raise RuntimeError("p:extLst não encontrado; o arquivo pode não conter extensões de seção.")
+
+        target_ext = None
+        for ext in extlst.findall(q(NS_P, "ext")):
+            if ext.get("uri") == GUID_SECTION_EXT:
+                target_ext = ext; break
+        if target_ext is None:
+            raise RuntimeError(f"As seções não foram encontradas em p:ext[@uri='{GUID_SECTION_EXT}'].")
+
+        # *:sectionLst (direto ou aninhado)
+        section_lsts = [e for e in target_ext if local(e.tag) == "sectionLst"]
+        if not section_lsts:
+            section_lsts = [e for e in target_ext.iter() if local(e.tag) == "sectionLst"]
+        if not section_lsts:
+            raise RuntimeError("Nenhum '*:sectionLst' encontrado dentro do ext alvo.")
+
+        secoes_idx = []
+        for sl in section_lsts:
+            sections = [e for e in sl if local(e.tag) == "section"]
+            for sec in sections:
+                nome = (sec.get("name") or "").strip()
+                # p14:sldId diretos ou dentro de p14:sldIdLst
+                direct = [e.get("id") for e in sec if local(e.tag) == "sldId" and e.get("id")]
+                nested = [e.get("id") for e in sec.iter() if local(e.tag) == "sldId" and e.get("id")]
+                sld_ids = nested or direct
+                indices = []
+                for sid in sld_ids:
+                    try: sid_int = int(sid)
+                    except:
+                        try: sid_int = int(float(sid))
+                        except: continue
+                    if sid_int in id_to_index:
+                        indices.append(id_to_index[sid_int])
+                indices = sorted(set(indices))
+                if indices:
+                    secoes_idx.append({'nome': nome, 'indices_slides': indices})
+        if not secoes_idx:
+            raise RuntimeError("SectionLst encontrado, mas nenhuma seção com sldId mapeável foi extraída.")
+        return secoes_idx
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+# ============================================
+# PATCHES: reescrever seções e converter PPTX -> PPSX
+# ============================================
+def _reempacotar_pasta_para_zip(dir_path: str, zip_path: str):
+    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _, files_ in os.walk(dir_path):
+            for f in files_:
+                abs_path = os.path.join(root, f)
+                rel = os.path.relpath(abs_path, dir_path)
+                z.write(abs_path, rel)
+
+def reescrever_secoes_para_unica(pptx_path: str, nome_secao: str):
+    """
+    Substitui as seções do arquivo por UMA única p14:section com:
+      - name = nome_secao
+      - id   = GUID {…}
+      - p14:sldIdLst/p14:sldId[@id] com TODOS os slides atuais (ordem de p:sldIdLst)
+    """
+    tmp = ".__fix_sections"
+    if os.path.exists(tmp): shutil.rmtree(tmp)
+    os.makedirs(tmp)
+
+    with zipfile.ZipFile(pptx_path, 'r') as z:
+        z.extractall(tmp)
+
+    pres_xml = os.path.join(tmp, "ppt", "presentation.xml")
+    if not os.path.exists(pres_xml):
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError("ppt/presentation.xml não encontrado ao reescrever seções.")
+
+    parser = etree.XMLParser(remove_blank_text=True, recover=True)
+    tree = etree.parse(pres_xml, parser)
+    root = tree.getroot()
+    q = lambda ns, tag: f"{{{ns}}}{tag}"
+
+    # ids atuais (p:sldIdLst)
+    sldIdLst = root.find(q(NS_P, "sldIdLst"))
+    if sldIdLst is None:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError("p:sldIdLst não encontrado ao reescrever seções.")
+    sld_ids = [e.get("id") for e in sldIdLst.findall(q(NS_P, "sldId")) if e.get("id")]
+
+    # garante p:extLst / p:ext target
+    extLst = root.find(q(NS_P, "extLst"))
+    if extLst is None:
+        extLst = etree.SubElement(root, q(NS_P, "extLst"))
+    target_ext = None
+    for ext in extLst.findall(q(NS_P, "ext")):
+        if ext.get("uri") == GUID_SECTION_EXT:
+            target_ext = ext; break
+    if target_ext is None:
+        target_ext = etree.SubElement(extLst, q(NS_P, "ext"))
+        target_ext.set("uri", GUID_SECTION_EXT)
+
+    # remove sectionLst antigos
+    for child in list(target_ext):
+        if etree.QName(child.tag).localname == "sectionLst":
+            target_ext.remove(child)
+
+    # cria novo p14:sectionLst -> section (GUID) -> sldIdLst -> sldId
+    sectionLst = etree.SubElement(target_ext, q(NS_P14, "sectionLst"))
+    section = etree.SubElement(sectionLst, q(NS_P14, "section"))
+    section.set("name", nome_secao)
+    section.set("id", "{" + str(uuid.uuid4()).upper() + "}")
+
+    sldIdLst_p14 = etree.SubElement(section, q(NS_P14, "sldIdLst"))
+    for sid in sld_ids:
+        sid_norm = str(int(float(sid)))
+        s = etree.SubElement(sldIdLst_p14, q(NS_P14, "sldId"))
+        s.set("id", sid_norm)
+
+    # salva e reempacota
+    tree.write(pres_xml, encoding="utf-8", xml_declaration=True, pretty_print=True)
+    new_zip = pptx_path + ".tmpzip"
+    _reempacotar_pasta_para_zip(tmp, new_zip)
+    os.replace(new_zip, pptx_path)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+def pptx_para_ppsx_real(pptx_path: str, ppsx_path: str):
+    """
+    Converte .pptx -> .ppsx REAL alterando APENAS o Override de /ppt/presentation.xml
+    no [Content_Types].xml, de *.presentation.main+xml -> *.slideshow.main+xml.
+    """
+    tmp = ".__types_fix"
+    if os.path.exists(tmp): shutil.rmtree(tmp)
+    os.makedirs(tmp)
+
+    with zipfile.ZipFile(pptx_path, 'r') as z:
+        z.extractall(tmp)
+
+    types_xml = os.path.join(tmp, "[Content_Types].xml")
+    parser = etree.XMLParser(remove_blank_text=True, recover=True)
+    tree = etree.parse(types_xml, parser)
+    root = tree.getroot()
+
+    # encontra Override de /ppt/presentation.xml e troca ContentType
+    for override in root.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Override"):
+        if override.get("PartName") == "/ppt/presentation.xml":
+            override.set("ContentType", CT_PPSX)
+            break
+
+    tree.write(types_xml, encoding="utf-8", xml_declaration=True, pretty_print=True)
+
+    # reempacota como .ppsx
+    with zipfile.ZipFile(ppsx_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+        for rootdir, _, files_ in os.walk(tmp):
+            for f in files_:
+                abs_path = os.path.join(rootdir, f)
+                rel = os.path.relpath(abs_path, tmp)
+                zout.write(abs_path, rel)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+# ============================================
+# GERADOR: REMOVE SLIDES, CORRIGE SEÇÕES, CONVERTE PPSX
+# ============================================
+def criar_arquivo_musica_ppsx(caminho_pptx_original, indices_slides, nome_base_saida, nome_secao_final):
+    """
+    1) copia o pacote e remove slides fora da música
+    2) salva .pptx intermediário
+    3) reescreve seções (1 seção válida com GUID e sldIdLst)
+    4) converte para .ppsx REAL (ContentType correto)
+    """
+    work_path = f"{nome_base_saida}_work.pptx"
+    shutil.copyfile(caminho_pptx_original, work_path)
+    prs = Presentation(work_path)
+
+    keep = sorted(set(int(i) for i in indices_slides))
+    total = len(prs.slides)
+    if not keep:
+        raise ValueError("Lista de índices vazia.")
+    if max(keep) >= total or min(keep) < 0:
+        raise IndexError(f"Índice fora do intervalo. Total de slides: {total}, manter: {keep}")
+
+    to_delete = [i for i in range(total) if i not in keep]
+    sldIdLst = prs.slides._sldIdLst
+    sldIds = list(sldIdLst)
+    for idx in sorted(to_delete, reverse=True):
+        sldId = sldIds[idx]
+        rId = sldId.rId
+        prs.part.drop_rel(rId)
+        sldIdLst.remove(sldId)
+
+    if len(prs.slides) == 0:
+        raise ValueError("Nenhum slide selecionado; não há o que salvar.")
+
+    # 1) salva PPTX intermediário
+    temp_pptx = f"{nome_base_saida}.pptx"
+    prs.save(temp_pptx)
+
+    # 2) reescreve seções
+    reescrever_secoes_para_unica(temp_pptx, nome_secao_final)
+
+    # 3) converte para PPSX REAL
+    out_ppsx = f"{nome_base_saida}.ppsx"
+    if os.path.exists(out_ppsx): os.remove(out_ppsx)
+    pptx_para_ppsx_real(temp_pptx, out_ppsx)
+
+    # limpeza
+    try: os.remove(work_path)
+    except Exception: pass
+    try: os.remove(temp_pptx)
+    except Exception: pass
+
+    return out_ppsx
+
+# ============================================
+# PROGRAMA PRINCIPAL (GERA TODAS AS MÚSICAS EM .PPSX)
+# ============================================
+print("=" * 60)
+print("PROCESSADOR DE APRESENTAÇÕES MUSICAIS (XML extLst) → PPSX REAL (TODAS)")
+print("=" * 60)
+
+print("\n📁 Faça upload do arquivo PPTX:")
+uploaded = files.upload()
+arquivo_pptx = list(uploaded.keys())[0]
+print(f"\n✅ Arquivo carregado: {arquivo_pptx}")
+
+try:
+    prs = Presentation(arquivo_pptx)
+    print(f"📊 Total de slides: {len(prs.slides)}")
+
+    # (1) seções via XML (extLst)
+    print("\n📖 Lendo seções (p:extLst/p:ext[@uri='{GUID_SECTION_EXT}']/p14:sectionLst)…")
+    secoes = extrair_secoes_com_indices_via_xml_stricto(arquivo_pptx)
+    print(f"✅ Seções encontradas (via XML): {len(secoes)}")
+
+    # (2)-(6) filtrar/formatar
+    musicas_validas = []
+    ignoradas_caps = ignoradas_por_nome = 0
+    for s in secoes:
+        nome = (s['nome'] or "").strip()
+        if nome and nome == nome.upper():           # (2) ignora CAIXA ALTA
+            ignoradas_caps += 1; continue
+        if normalizar_nome(nome) in IGNORAR_POR_NOME_NORMALIZADO:  # ignora Índices/Index
+            ignoradas_por_nome += 1; continue
+        nome_fmt = formatar_nome_secao_regra(nome)  # (3)(4)(5)
+        if not nome_fmt: continue
+        musicas_validas.append({
+            "nome_original": nome,
+            "nome_formatado": nome_fmt,
+            "indices_slides": s["indices_slides"],
+        })
+
+    print(f"\n🧮 Totais → Seções XML: {len(secoes)} | Ignoradas (CAIXA ALTA): {ignoradas_caps} | Ignoradas por nome: {ignoradas_por_nome} | Válidas: {len(musicas_validas)}")
+    if not musicas_validas:
+        raise RuntimeError("Após filtrar, não sobrou nenhuma música válida.")
+
+    print(f"\n▶️ Gerando {len(musicas_validas)} arquivo(s) .ppsx…")
+
+    used_names = set()
+    gerados, falhas = [], []
+
+    for i, m in enumerate(musicas_validas, 1):
+        try:
+            base = gerar_nome_arquivo(m["nome_formatado"], used_names)
+            print(f"[{i}/{len(musicas_validas)}] {m['nome_formatado']}  |  Slides: {m['indices_slides']}")
+            saida = criar_arquivo_musica_ppsx(
+                caminho_pptx_original=arquivo_pptx,
+                indices_slides=m["indices_slides"],
+                nome_base_saida=base,
+                nome_secao_final=m["nome_formatado"]
+            )
+            gerados.append(saida)
+            files.download(saida)
+            time.sleep(0.35)  # respiro para o navegador
+        except Exception as e:
+            print(f"  ❌ Falha: {e}")
+            falhas.append((m["nome_formatado"], str(e)))
+
+    print("\n✅ Concluído.")
+    print(f"Arquivos gerados: {len(gerados)}")
+    if falhas:
+        print(f"Falhas: {len(falhas)}")
+        for nome, err in falhas[:10]:
+            print(f"  - {nome}: {err}")
+        if len(falhas) > 10:
+            print(f"  (+{len(falhas)-10} outras falhas)")
+
+except Exception as e:
+    print(f"\n❌ Erro: {e}")
+    import traceback; traceback.print_exc()
