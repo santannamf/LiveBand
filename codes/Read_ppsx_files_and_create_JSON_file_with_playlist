@@ -1,0 +1,89 @@
+/**
+ * Scan a Drive folder for .ppsx files and build songs.json
+ * Folder ID is taken from Script Properties: FOLDER_ID
+ */
+function updateSongsJson() {
+  var folderId = PropertiesService.getScriptProperties().getProperty("FOLDER_ID");
+  if (!folderId) throw new Error("FOLDER_ID ausente em Propriedades do script.");
+
+  var folder = DriveApp.getFolderById(folderId);
+
+  // Iterate ALL files and filter for PPSX by name or MIME (PPSX MIME is not covered by MimeType.MICROSOFT_POWERPOINT)
+  var PPSX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.slideshow';
+  var files = [];
+  var it = folder.getFiles();
+  while (it.hasNext()) {
+    var f = it.next();
+    var name = f.getName();
+    var mime = f.getMimeType();
+    if (/\.ppsx$/i.test(name) || mime === PPSX_MIME) {
+      if (!/^~\$/i.test(name)) files.push(f); // ignore temporary files like "~$..."
+    }
+  }
+
+  var songs = [];
+
+  files.forEach(function(file) {
+    var nameNoExt = file.getName().replace(/\.ppsx$/i, "");
+    var parsed = parseArtistAndTitle_(nameNoExt); // { artist, title }
+    var id = slug_(parsed.title);
+
+    songs.push({
+      id: id,
+      title: parsed.title,
+      artist: parsed.artist,
+      alt_titles: [],
+      keywords: [],
+      genre: [],
+      epoch: null,
+      language: "pt-BR",
+      key: null,
+      bpm: null,
+      duration_sec: null,
+      mood: [],
+      tags: [],
+      ppsx_file: file.getName(),
+      ppsx_link: file.getUrl(),
+      ccli: null,
+      rights: null,
+      last_verified_at: new Date().toISOString(),
+      source: "initial-import",
+      notes: "",
+      _drive_id: file.getId()
+    });
+  });
+
+  var json = JSON.stringify(songs, null, 2);
+
+  // Save JSON file into the same folder
+  var existing = folder.getFilesByName("songs.json");
+  if (existing.hasNext()) {
+    existing.next().setContent(json);
+  } else {
+    folder.createFile("songs.json", json, MimeType.PLAIN_TEXT);
+  }
+}
+
+/* --- helpers --- */
+
+// Expected filename: "Artist - Title"
+function parseArtistAndTitle_(base) {
+  var sep = base.indexOf(" - ");
+  if (sep > -1) {
+    return {
+      artist: base.slice(0, sep).trim(),
+      title: base.slice(sep + 3).trim()
+    };
+  }
+  // fallback: no hyphen → everything is title
+  return { artist: "", title: base.trim() };
+}
+
+// slugify: remove accents; non-alnum → underscore
+function slug_(s) {
+  return s.normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
